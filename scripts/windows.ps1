@@ -1,6 +1,7 @@
 #requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
 
 $Root = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $Root 'config.yaml'
@@ -19,6 +20,8 @@ $NativeErr = Join-Path $Runtime 'agentdock-native.err.log'
 $TunnelExe = Join-Path $Bin 'tunnel-client.exe'
 $AgentDockExe = Join-Path $Bin 'agentdock.exe'
 $AgentDockHome = Join-Path $Runtime 'agentdock-home'
+$ExternalTaskName = 'AgentDock Secure Tunnel'
+$ExternalTaskPath = '\AgentDock\'
 
 function Fail([string]$Message) { throw $Message }
 
@@ -94,12 +97,31 @@ function Read-Config {
     }
     if ($null -ne $current) { $items.Add([pscustomobject]$current) }
 
-    foreach ($required in @('tunnel_id','runtime_api_key','agentdock_port','default_workspace')) {
+    foreach ($required in @('tunnel_id','runtime_api_key','agentdock_port')) {
         if (-not $top.ContainsKey($required) -or [string]::IsNullOrWhiteSpace([string]$top[$required])) { Fail "Missing config value: $required" }
     }
 
     $requestedMode = if ($top.ContainsKey('deployment_mode')) { ([string]$top['deployment_mode']).ToLowerInvariant() } else { 'auto' }
-    if ($requestedMode -notin @('auto','docker','native')) { Fail 'deployment_mode must be auto, docker or native.' }
+    if ($requestedMode -notin @('auto','docker','native','external')) { Fail 'deployment_mode must be auto, docker, native or external.' }
+
+    $port = 0
+    if (-not [int]::TryParse([string]$top['agentdock_port'],[ref]$port) -or $port -lt 1 -or $port -gt 65535) { Fail 'agentdock_port must be 1-65535.' }
+
+    $externalRuntimeRoot = if ($top.ContainsKey('external_agentdock_runtime_root')) { [string]$top['external_agentdock_runtime_root'] } else { '' }
+    if ($requestedMode -eq 'external') {
+        return [pscustomobject]@{
+            TunnelId=[string]$top['tunnel_id']
+            RuntimeApiKey=[string]$top['runtime_api_key']
+            Port=$port
+            DefaultWorkspace=''
+            RequestedMode=$requestedMode
+            Workspaces=@()
+            HasWslWorkspace=$false
+            ExternalRuntimeRoot=$externalRuntimeRoot
+        }
+    }
+
+    if (-not $top.ContainsKey('default_workspace') -or [string]::IsNullOrWhiteSpace([string]$top['default_workspace'])) { Fail 'Missing config value: default_workspace' }
 
     $workspaces = New-Object System.Collections.Generic.List[object]
     foreach ($item in $items) {
@@ -114,9 +136,6 @@ function Read-Config {
     $default = [string]$top['default_workspace']
     if (-not ($workspaces | Where-Object {$_.Name -eq $default})) { Fail "default_workspace '$default' does not match any workspace name." }
 
-    $port = 0
-    if (-not [int]::TryParse([string]$top['agentdock_port'],[ref]$port) -or $port -lt 1 -or $port -gt 65535) { Fail 'agentdock_port must be 1-65535.' }
-
     return [pscustomobject]@{
         TunnelId=[string]$top['tunnel_id']
         RuntimeApiKey=[string]$top['runtime_api_key']
@@ -125,6 +144,7 @@ function Read-Config {
         RequestedMode=$requestedMode
         Workspaces=$workspaces
         HasWslWorkspace=[bool]($workspaces | Where-Object {$_.PathType -eq 'wsl'})
+        ExternalRuntimeRoot=$externalRuntimeRoot
     }
 }
 
@@ -525,6 +545,7 @@ function Confirm-NativeDeployment($Config) {
 }
 
 function Select-Deployment($Config) {
+    if ($Config.RequestedMode -eq 'external') { return 'external' }
     if ($Config.RequestedMode -eq 'native') { return Confirm-NativeDeployment $Config }
 
     if ($Config.HasWslWorkspace) {
@@ -609,8 +630,92 @@ function Assert-ModeAvailable([string]$Mode) {
             Fail 'WSL Docker runtime is not available. Rerun install to repair or reinstall Docker Engine in WSL.'
         }
         'native' { return }
+        'external' { return }
         default { Fail "Unknown installed deployment mode: $Mode" }
     }
+}
+
+function Resolve-ExternalAgentDockRuntimeRoot($Config) {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.ExternalRuntimeRoot)) {
+        $configured = [Environment]::ExpandEnvironmentVariables([string]$Config.ExternalRuntimeRoot)
+        if (-not [IO.Path]::IsPathRooted($configured)) { $configured = Join-Path $Root $configured }
+        $candidates.Add([IO.Path]::GetFullPath($configured))
+    }
+
+    try {
+        foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='agentdock.exe'" -ErrorAction Stop)) {
+            $cmd = [string]$process.CommandLine
+            if ($cmd -notmatch '(?i)service\s+launch-core') { continue }
+            if ($cmd -match '(?i)--runtime-root\s+(?:"(?<quoted>[^"]+)"|(?<plain>.+?))(?=\s+--[A-Za-z0-9-]+|$)') {
+                $candidate = if ($matches['quoted']) { $matches['quoted'] } else { $matches['plain'].Trim() }
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add([IO.Path]::GetFullPath($candidate)) }
+            }
+        }
+    } catch {}
+
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates.Add((Join-Path $env:LOCALAPPDATA 'AgentDock'))
+    }
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath (Join-Path $candidate 'auth-token.dpapi') -PathType Leaf) { return $candidate }
+    }
+    Fail 'Unable to locate the existing AgentDock Windows runtime. Set external_agentdock_runtime_root in config.yaml.'
+}
+
+function Read-AgentDockProtectedText([string]$Path,[string]$Entropy) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Fail "AgentDock protected credential not found: $Path" }
+    try {
+        $encoded = [IO.File]::ReadAllText($Path,[Text.Encoding]::UTF8).Trim()
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            [Convert]::FromBase64String($encoded),
+            [Text.Encoding]::UTF8.GetBytes($Entropy),
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        $value = [Text.Encoding]::UTF8.GetString($plainBytes)
+        if ([string]::IsNullOrWhiteSpace($value)) { Fail "AgentDock protected credential is empty: $Path" }
+        return $value
+    } catch {
+        Fail "Unable to read AgentDock protected credential as the current Windows user: $Path"
+    }
+}
+
+function Get-ExternalAgentDockToken($Config) {
+    $runtimeRoot = Resolve-ExternalAgentDockRuntimeRoot $Config
+    return Read-AgentDockProtectedText (Join-Path $runtimeRoot 'auth-token.dpapi') 'agentdock.startup.v1'
+}
+
+function Test-AgentDockBearerAuth([int]$Port,[string]$Token) {
+    $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/mcp")
+    $request.Method = 'GET'
+    $request.Proxy = $null
+    $request.Timeout = 4000
+    $request.ReadWriteTimeout = 4000
+    $request.Headers['Authorization'] = "Bearer $Token"
+    $code = 0
+    try {
+        $response = $request.GetResponse()
+        try { $code = [int]$response.StatusCode } finally { $response.Close() }
+    } catch [Net.WebException] {
+        if ($null -ne $_.Exception.Response) {
+            try { $code = [int]$_.Exception.Response.StatusCode } finally { $_.Exception.Response.Close() }
+        } else {
+            Fail 'AgentDock MCP authentication probe could not reach the local endpoint.'
+        }
+    }
+    if ($code -eq 401 -or $code -eq 403 -or $code -le 0) { Fail "AgentDock bearer-token probe failed (HTTP $code)." }
+}
+
+function Get-ExternalTunnelTask {
+    try { return Get-ScheduledTask -TaskName $ExternalTaskName -TaskPath $ExternalTaskPath -ErrorAction Stop } catch { return $null }
+}
+
+function Test-ExternalTunnelTaskInstalled { return ($null -ne (Get-ExternalTunnelTask)) }
+
+function Test-ExternalTunnelTaskRunning {
+    $task = Get-ExternalTunnelTask
+    return ($null -ne $task -and [string]$task.State -eq 'Running')
 }
 
 function New-Token {
@@ -620,7 +725,8 @@ function New-Token {
     return -join ($b | ForEach-Object {$_.ToString('x2')})
 }
 
-function Get-Token {
+function Get-Token($Config,[string]$Mode) {
+    if ($Mode -eq 'external') { return Get-ExternalAgentDockToken $Config }
     New-Item -ItemType Directory -Force $Runtime | Out-Null
     if (Test-Path $TokenPath) {
         $t = (Get-Content $TokenPath -Raw).Trim()
@@ -843,6 +949,46 @@ function Wait-AgentDock([int]$Port) {
     Fail 'AgentDock health check failed. Run logs.'
 }
 
+function Start-ExternalTunnelTask {
+    $task = Get-ExternalTunnelTask
+    if ($null -eq $task) { return $false }
+    if ([string]$task.State -ne 'Running') { Start-ScheduledTask -TaskName $ExternalTaskName -TaskPath $ExternalTaskPath }
+    for ($i=0; $i -lt 20; $i++) {
+        if (Test-PidFile $TunnelPid) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return (Test-ExternalTunnelTaskRunning)
+}
+
+function Stop-ExternalTunnelTask {
+    if (Test-ExternalTunnelTaskInstalled) {
+        Stop-ScheduledTask -TaskName $ExternalTaskName -TaskPath $ExternalTaskPath -ErrorAction SilentlyContinue
+    }
+}
+
+function Tunnel-RunCommand {
+    $cfg = Read-Config
+    if ($cfg.RequestedMode -ne 'external') { Fail 'tunnel-run requires deployment_mode: external.' }
+    if (-not (Test-Path -LiteralPath $TunnelExe -PathType Leaf)) { Fail 'tunnel-client is missing. Run .\agentdock.cmd service-install or install first.' }
+    $token = Get-Token $cfg 'external'
+    Write-TunnelProfile $cfg $token
+    Wait-AgentDock $cfg.Port
+    Test-AgentDockBearerAuth $cfg.Port $token
+
+    $env:CONTROL_PLANE_API_KEY = $cfg.RuntimeApiKey
+    $env:AGENTDOCK_BEARER_HEADER = "Bearer $token"
+    Remove-Item $TunnelLog,$TunnelErr -Force -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $TunnelExe -ArgumentList @('run','--profile-file',$TunnelProfile) -WindowStyle Hidden -PassThru -RedirectStandardOutput $TunnelLog -RedirectStandardError $TunnelErr
+    Set-Content $TunnelPid $p.Id -Encoding ASCII
+    try {
+        $p.WaitForExit()
+        $code = $p.ExitCode
+    } finally {
+        if ((Test-Path $TunnelPid) -and ((Get-Content $TunnelPid -Raw).Trim() -eq [string]$p.Id)) { Remove-Item $TunnelPid -Force -ErrorAction SilentlyContinue }
+    }
+    if ($code -ne 0) { Fail "tunnel-client exited with code $code." }
+}
+
 function Test-StartPreflight {
     $cfg = Read-Config
     Install-TunnelClient
@@ -850,9 +996,13 @@ function Test-StartPreflight {
     Assert-ModeAvailable $mode
     if ($mode -like 'docker-*') {
         Assert-DockerConfig $cfg $mode
-    } else {
+    } elseif ($mode -eq 'native') {
         $ws = Get-Workspace $cfg $cfg.DefaultWorkspace
         if ($ws.PathType -eq 'wsl') { Fail 'Native Windows AgentDock cannot use a WSL default workspace.' }
+    } elseif ($mode -eq 'external') {
+        $token = Get-Token $cfg $mode
+        Wait-AgentDock $cfg.Port
+        Test-AgentDockBearerAuth $cfg.Port $token
     }
 }
 
@@ -861,17 +1011,24 @@ function Install-Command {
     New-Item -ItemType Directory -Force $Runtime,$Bin | Out-Null
     Install-TunnelClient
     $mode = Select-Deployment $cfg
-    $token = Get-Token
+    $token = Get-Token $cfg $mode
     Write-TunnelProfile $cfg $token
     Set-Content $ModePath $mode -Encoding ASCII
     if ($mode -like 'docker-*') {
         Assert-ModeAvailable $mode
         Write-Compose $cfg $mode $token
         Invoke-Compose -ComposeArgs @('pull')
-    } else {
+    } elseif ($mode -eq 'native') {
         Install-NativeAgentDock
+    } elseif ($mode -eq 'external') {
+        Wait-AgentDock $cfg.Port
+        Test-AgentDockBearerAuth $cfg.Port $token
     }
-    Write-Host "Installed. Default workspace: $($cfg.DefaultWorkspace)" -ForegroundColor Green
+    if ($mode -eq 'external') {
+        Write-Host "Installed in external mode. Existing AgentDock: http://127.0.0.1:$($cfg.Port)/mcp" -ForegroundColor Green
+    } else {
+        Write-Host "Installed. Default workspace: $($cfg.DefaultWorkspace)" -ForegroundColor Green
+    }
     Write-Host 'Next: .\agentdock.cmd start'
 }
 
@@ -880,41 +1037,47 @@ function Start-Command {
     Install-TunnelClient
     $mode = Get-InstalledMode
     Assert-ModeAvailable $mode
-    $token = Get-Token
+    $token = Get-Token $cfg $mode
     Write-TunnelProfile $cfg $token
     if ($mode -like 'docker-*') {
         Write-Compose $cfg $mode $token
         Invoke-Compose -ComposeArgs @('up','-d','--force-recreate')
-    } else {
+    } elseif ($mode -eq 'native') {
         Start-Native $cfg $token
+    } elseif ($mode -eq 'external') {
+        Wait-AgentDock $cfg.Port
+        Test-AgentDockBearerAuth $cfg.Port $token
     }
     Wait-AgentDock $cfg.Port
-    Start-Tunnel $cfg $token
+    if ($mode -eq 'external' -and (Test-ExternalTunnelTaskInstalled)) {
+        if (-not (Start-ExternalTunnelTask)) { Fail 'AgentDock Secure Tunnel scheduled task did not start.' }
+    } else {
+        Start-Tunnel $cfg $token
+    }
     Write-Host 'AgentDock : RUNNING' -ForegroundColor Green
     Write-Host 'Tunnel    : RUNNING' -ForegroundColor Green
     Write-Host "Mode      : $mode"
     if ($mode -like 'docker-*') {
         Write-Host "Default   : $($cfg.DefaultWorkspace) -> /home/agentdock/AgentDock/workspaces/$($cfg.DefaultWorkspace)"
-    } else {
+    } elseif ($mode -eq 'native') {
         Write-Host "Default   : $($cfg.DefaultWorkspace)"
     }
     Write-Host "MCP       : http://127.0.0.1:$($cfg.Port)/mcp"
 }
 
 function Stop-Command {
+    $mode = if (Test-Path $ModePath) { Get-InstalledMode } else { '' }
+    if ($mode -eq 'external') { Stop-ExternalTunnelTask }
     if (Test-PidFile $TunnelPid) {
         Stop-Process -Id ([int](Get-Content $TunnelPid -Raw).Trim()) -Force -ErrorAction SilentlyContinue
     }
     Remove-Item $TunnelPid -Force -ErrorAction SilentlyContinue
-    if (Test-Path $ModePath) {
-        $mode = Get-InstalledMode
-        if ($mode -like 'docker-*') {
-            if (Test-Path $Compose) { Invoke-Compose -ComposeArgs @('down') }
-        } elseif (Test-PidFile $NativePid) {
-            Stop-Process -Id ([int](Get-Content $NativePid -Raw).Trim()) -Force -ErrorAction SilentlyContinue
-        }
+    if ($mode -like 'docker-*') {
+        if (Test-Path $Compose) { Invoke-Compose -ComposeArgs @('down') }
+    } elseif ($mode -eq 'native' -and (Test-PidFile $NativePid)) {
+        Stop-Process -Id ([int](Get-Content $NativePid -Raw).Trim()) -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item $NativePid -Force -ErrorAction SilentlyContinue
+    if ($mode -ne 'external') { Remove-Item $NativePid -Force -ErrorAction SilentlyContinue }
     Write-Host 'Stopped.'
 }
 
@@ -926,12 +1089,13 @@ function Status-Command {
         $r = Invoke-WebRequest "http://127.0.0.1:$($cfg.Port)/healthz" -UseBasicParsing -TimeoutSec 2
         if ($r.StatusCode -eq 200) { $a = 'RUNNING' }
     } catch {}
-    if (Test-PidFile $TunnelPid) { $t = 'RUNNING' }
+    if ((Test-PidFile $TunnelPid) -or (Test-ExternalTunnelTaskRunning)) { $t = 'RUNNING' }
     $mode = if (Test-Path $ModePath) { Get-InstalledMode } else { 'NOT INSTALLED' }
     Write-Host "AgentDock : $a"
     Write-Host "Tunnel    : $t"
     Write-Host "Mode      : $mode"
-    Write-Host "Default   : $($cfg.DefaultWorkspace)"
+    if ($mode -ne 'external') { Write-Host "Default   : $($cfg.DefaultWorkspace)" }
+    if (Test-ExternalTunnelTaskInstalled) { Write-Host "Task      : $ExternalTaskPath$ExternalTaskName ($(if (Test-ExternalTunnelTaskRunning) { 'RUNNING' } else { 'READY' }))" }
     Write-Host "MCP       : http://127.0.0.1:$($cfg.Port)/mcp"
 }
 
@@ -958,11 +1122,13 @@ function Update-Command {
     $mode = Get-InstalledMode
     Assert-ModeAvailable $mode
     if ($mode -like 'docker-*') {
-        $token = Get-Token
+        $token = Get-Token $cfg $mode
         Write-Compose $cfg $mode $token
         Invoke-Compose -ComposeArgs @('pull')
-    } else {
+    } elseif ($mode -eq 'native') {
         Install-NativeAgentDock -Force
+    } elseif ($mode -eq 'external') {
+        Write-Host 'External AgentDock is user-managed; only tunnel-client is updated.'
     }
 }
 
@@ -976,5 +1142,6 @@ switch ($Command) {
     'status' { Status-Command }
     'logs' { Logs-Command }
     'update' { Update-Command }
+    'tunnel-run' { Tunnel-RunCommand }
     default { Write-Host 'Usage: .\agentdock.cmd {install|start|stop|restart|apply|status|logs|update}' }
 }

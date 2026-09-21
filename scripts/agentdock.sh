@@ -16,6 +16,9 @@ NATIVE_PID="$RUNTIME/agentdock-native.pid"
 TUNNEL_LOG="$RUNTIME/tunnel-client.log"
 NATIVE_LOG="$RUNTIME/agentdock-native.log"
 NATIVE_HOME="$RUNTIME/agentdock-home"
+DESKTOP_ENV="${AGENTDOCK_DESKTOP_ENV:-$HOME/Library/Application Support/AgentDock/agentdock.env}"
+LAUNCHD_LABEL="com.aniss.agentdock-secure-tunnel"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -64,14 +67,20 @@ load_config() {
   TUNNEL_ID="$(top_cfg tunnel_id)"
   RUNTIME_API_KEY="$(top_cfg runtime_api_key)"
   PORT="$(top_cfg agentdock_port)"
-  DEFAULT_WORKSPACE="$(top_cfg default_workspace)"
 
-  case "$DEPLOYMENT_MODE" in auto|docker|native) ;; *) fail "deployment_mode must be auto, docker, or native" ;; esac
+  case "$DEPLOYMENT_MODE" in auto|docker|native|external) ;; *) fail "deployment_mode must be auto, docker, native, or external" ;; esac
   [ "$TUNNEL_ID" != "TUNNEL_ID_HERE" ] || fail "Set tunnel_id in config.yaml"
   [ "$RUNTIME_API_KEY" != "RUNTIME_API_KEY_HERE" ] || fail "Set runtime_api_key in config.yaml"
   [[ "$PORT" =~ ^[0-9]+$ ]] || fail "agentdock_port must be numeric"
   [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fail "agentdock_port out of range"
 
+  if [ "$DEPLOYMENT_MODE" = external ]; then
+    DEFAULT_WORKSPACE=""
+    WORKSPACES=""
+    return
+  fi
+
+  DEFAULT_WORKSPACE="$(top_cfg default_workspace)"
   local raw normalized="" seen="|" found=0 name path mode final_name
   raw="$(read_workspaces_raw)"
   [ -n "$raw" ] || fail "At least one workspace is required"
@@ -113,7 +122,28 @@ random_token() {
   if command -v openssl >/dev/null 2>&1; then openssl rand -hex 32; else od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; fi
 }
 
+desktop_env_value() {
+  local key="$1" line
+  [ -f "$DESKTOP_ENV" ] || return 1
+  line="$(awk -F= -v k="$key" '$1==k {print; exit}' "$DESKTOP_ENV")"
+  [ -n "$line" ] || return 1
+  strip_quotes "${line#*=}"
+}
+
+external_token() {
+  local token="${AGENTDOCK_AUTH_TOKEN:-}"
+  if [ -z "$token" ] && [ "$(uname -s)" = Darwin ]; then
+    token="$(desktop_env_value AGENTDOCK_AUTH_TOKEN || true)"
+  fi
+  [ -n "$token" ] || fail "external mode requires AGENTDOCK_AUTH_TOKEN, or a macOS AgentDock Desktop env at: $DESKTOP_ENV"
+  printf '%s' "$token"
+}
+
 get_token() {
+  if [ "${DEPLOYMENT_MODE:-}" = external ]; then
+    external_token
+    return
+  fi
   mkdir -p "$RUNTIME"
   chmod 700 "$RUNTIME" 2>/dev/null || true
   [ -s "$TOKEN_FILE" ] || { random_token > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE" 2>/dev/null || true; }
@@ -133,6 +163,7 @@ install_native_agentdock() {
 docker_ready() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; }
 
 select_mode() {
+  [ "$DEPLOYMENT_MODE" = external ] && { echo external; return; }
   [ "$DEPLOYMENT_MODE" = native ] && { echo native; return; }
   docker_ready && { echo docker; return; }
   [ "$DEPLOYMENT_MODE" = docker ] && fail "Docker mode requested but Docker Engine/Compose is unavailable"
@@ -247,8 +278,17 @@ start_native() {
   fi
 }
 
+macos_service_running() {
+  [ "$(uname -s)" = Darwin ] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1
+}
+
 start_tunnel() {
   local token="$1"
+  if [ "${DEPLOYMENT_MODE:-}" = external ] && macos_service_running; then
+    return 0
+  fi
   if ! pid_alive "$TUNNEL_PID"; then
     : > "$TUNNEL_LOG"
     CONTROL_PLANE_API_KEY="$RUNTIME_API_KEY" AGENTDOCK_BEARER_HEADER="Bearer $token" nohup "$BIN_DIR/tunnel-client" run --profile-file "$PROFILE" >> "$TUNNEL_LOG" 2>&1 </dev/null & echo $! > "$TUNNEL_PID"
@@ -261,30 +301,94 @@ wait_agentdock() {
   fail "AgentDock health check failed"
 }
 
+check_agentdock_auth() {
+  local token="$1" code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 4 \
+    -H "Authorization: Bearer ${token}" \
+    "http://127.0.0.1:${PORT}/mcp" || true)"
+  case "$code" in
+    000|401|403|'') fail "AgentDock bearer-token probe failed (HTTP ${code:-none})" ;;
+  esac
+}
+
+tunnel_run_cmd() {
+  load_config
+  [ "$DEPLOYMENT_MODE" = external ] || fail "tunnel-run is only supported with deployment_mode: external"
+  install_tunnel_client
+  local token
+  token="$(get_token)"
+  write_profile
+  wait_agentdock
+  check_agentdock_auth "$token"
+  exec env \
+    CONTROL_PLANE_API_KEY="$RUNTIME_API_KEY" \
+    AGENTDOCK_BEARER_HEADER="Bearer $token" \
+    "$BIN_DIR/tunnel-client" run --profile-file "$PROFILE"
+}
+
 install_cmd() {
   echo "==> Checking configuration" >&2
   load_config; mkdir -p "$RUNTIME" "$BIN_DIR"; install_tunnel_client
   local mode token
   echo "==> Selecting deployment mode" >&2
   mode="$(select_mode)"; token="$(get_token)"; write_profile
-  if [ "$mode" = docker ]; then
-    echo "==> Pulling AgentDock Docker image" >&2
-    write_compose "$token"; docker compose -f "$COMPOSE" pull
-  else
-    echo "==> Installing native AgentDock (no container directory isolation)" >&2
-    install_native_agentdock
-  fi
+  case "$mode" in
+    docker)
+      echo "==> Pulling AgentDock Docker image" >&2
+      write_compose "$token"; docker compose -f "$COMPOSE" pull
+      ;;
+    native)
+      echo "==> Installing native AgentDock (no container directory isolation)" >&2
+      install_native_agentdock
+      ;;
+    external)
+      echo "==> Using existing AgentDock on 127.0.0.1:${PORT}" >&2
+      wait_agentdock
+      check_agentdock_auth "$token"
+      ;;
+  esac
   printf '%s' "$mode" > "$MODE_FILE"
-  echo "Installed in $mode mode. Default workspace: $DEFAULT_WORKSPACE"
+  if [ "$mode" = external ]; then
+    echo "Installed in external mode. Existing AgentDock: http://127.0.0.1:${PORT}/mcp"
+  else
+    echo "Installed in $mode mode. Default workspace: $DEFAULT_WORKSPACE"
+  fi
 }
 
 start_cmd() {
   load_config; install_tunnel_client; [ -f "$MODE_FILE" ] || fail "Run install first"
   local mode token
   mode="$(cat "$MODE_FILE")"; token="$(get_token)"; write_profile
-  if [ "$mode" = docker ]; then write_compose "$token"; docker compose -f "$COMPOSE" up -d --force-recreate; else start_native "$token"; fi
-  wait_agentdock; start_tunnel "$token"
-  echo "AgentDock : RUNNING"; echo "Tunnel    : RUNNING"; echo "Mode      : $mode"; echo "Default   : $DEFAULT_WORKSPACE -> /home/agentdock/AgentDock/workspaces/$DEFAULT_WORKSPACE"; echo "MCP       : http://127.0.0.1:${PORT}/mcp"
+
+  case "$mode" in
+    docker)
+      write_compose "$token"
+      docker compose -f "$COMPOSE" up -d --force-recreate
+      ;;
+    native)
+      start_native "$token"
+      ;;
+    external)
+      if [ "$(uname -s)" = Darwin ] && [ -f "$LAUNCHD_PLIST" ]; then
+        if ! macos_service_running; then
+          launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
+        fi
+        launchctl kickstart "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+      fi
+      ;;
+    *) fail "Unknown installed mode: $mode" ;;
+  esac
+
+  wait_agentdock
+  [ "$mode" = external ] && check_agentdock_auth "$token"
+  start_tunnel "$token"
+  echo "AgentDock : RUNNING"
+  echo "Tunnel    : RUNNING"
+  echo "Mode      : $mode"
+  if [ "$mode" != external ]; then
+    echo "Default   : $DEFAULT_WORKSPACE -> /home/agentdock/AgentDock/workspaces/$DEFAULT_WORKSPACE"
+  fi
+  echo "MCP       : http://127.0.0.1:${PORT}/mcp"
 }
 
 stop_cmd() {
@@ -293,6 +397,7 @@ stop_cmd() {
   if [ -f "$MODE_FILE" ]; then
     local mode
     mode="$(cat "$MODE_FILE")"
+    if [ "$mode" = external ] && macos_service_running; then launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true; fi
     if [ "$mode" = docker ] && [ -f "$COMPOSE" ] && command -v docker >/dev/null 2>&1; then docker compose -f "$COMPOSE" down; fi
     if [ "$mode" = native ] && pid_alive "$NATIVE_PID"; then kill "$(cat "$NATIVE_PID")" 2>/dev/null || true; fi
   fi
@@ -303,15 +408,20 @@ status_cmd() {
   load_config
   local a=STOPPED t=STOPPED mode
   curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1 && a=RUNNING || true
-  pid_alive "$TUNNEL_PID" && t=RUNNING || true
+  if pid_alive "$TUNNEL_PID" || { [ "$DEPLOYMENT_MODE" = external ] && macos_service_running; }; then t=RUNNING; fi
   mode="$(cat "$MODE_FILE" 2>/dev/null || echo 'NOT INSTALLED')"
-  echo "AgentDock : $a"; echo "Tunnel    : $t"; echo "Mode      : $mode"; echo "Default   : $DEFAULT_WORKSPACE"; echo "MCP       : http://127.0.0.1:${PORT}/mcp"
+  echo "AgentDock : $a"
+  echo "Tunnel    : $t"
+  echo "Mode      : $mode"
+  [ "$mode" != external ] && echo "Default   : $DEFAULT_WORKSPACE"
+  echo "MCP       : http://127.0.0.1:${PORT}/mcp"
 }
 
 logs_cmd() {
   [ -f "$MODE_FILE" ] && [ "$(cat "$MODE_FILE")" = docker ] && [ -f "$COMPOSE" ] && docker compose -f "$COMPOSE" logs --tail 100 agentdock || true
   [ -f "$NATIVE_LOG" ] && tail -n 100 "$NATIVE_LOG"
   [ -f "$TUNNEL_LOG" ] && tail -n 100 "$TUNNEL_LOG"
+  [ -f "$HOME/Library/Logs/agentdock-secure-tunnel.log" ] && tail -n 100 "$HOME/Library/Logs/agentdock-secure-tunnel.log"
   return 0
 }
 
@@ -319,12 +429,14 @@ apply_cmd() { stop_cmd; start_cmd; }
 
 update_cmd() {
   load_config; install_tunnel_client; [ -f "$MODE_FILE" ] || fail "Run install first"
-  if [ "$(cat "$MODE_FILE")" = docker ]; then
-    local token
-    token="$(get_token)"; write_compose "$token"; docker compose -f "$COMPOSE" pull
-  else
-    install_native_agentdock --force
-  fi
+  case "$(cat "$MODE_FILE")" in
+    docker)
+      local token
+      token="$(get_token)"; write_compose "$token"; docker compose -f "$COMPOSE" pull
+      ;;
+    native) install_native_agentdock --force ;;
+    external) echo "External AgentDock is user-managed; only tunnel-client updates apply." ;;
+  esac
 }
 
 case "${1:-help}" in
@@ -335,5 +447,6 @@ case "${1:-help}" in
   status) status_cmd ;;
   logs) logs_cmd ;;
   update) update_cmd ;;
+  tunnel-run) tunnel_run_cmd ;;
   *) echo "Usage: ./agentdock {install|start|stop|restart|apply|status|logs|update}" ;;
 esac

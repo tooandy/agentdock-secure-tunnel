@@ -60,6 +60,7 @@ cp config.example.yaml config.yaml
 
 ```yaml
 # auto = 优先使用 Docker
+# external = 复用已经运行的 AgentDock，只启动 tunnel
 deployment_mode: 'auto'
 
 # OpenAI Tunnel ID
@@ -183,6 +184,41 @@ macOS / Linux：
 ```bash
 ./agentdock apply
 ```
+
+### 只使用 Tunnel，复用已有 AgentDock（macOS / Windows）
+
+如果本机已经由 AgentDock Desktop 运行 AgentDock，不需要本项目再安装或启动第二套 AgentDock。将配置改为：
+
+```yaml
+deployment_mode: 'external'
+agentdock_port: 8765
+```
+
+`external` 模式只连接 `http://127.0.0.1:<agentdock_port>/mcp`，不会启动、停止或更新已有 AgentDock Core：
+
+- macOS Desktop：复用 `~/Library/Application Support/AgentDock/agentdock.env` 中的 `AGENTDOCK_AUTH_TOKEN`；也可以由当前进程环境显式提供 `AGENTDOCK_AUTH_TOKEN`。
+- Windows Desktop：自动发现正在运行的 `agentdock.exe service launch-core --runtime-root ...`，并使用与 AgentDock 官方安装器相同的 DPAPI `CurrentUser` 保护格式在内存中读取 `auth-token.dpapi`。不会把解密后的 Token 写入文件。自动发现失败时可设置 `external_agentdock_runtime_root`。
+
+macOS 首次安装后台 LaunchAgent：
+
+```bash
+./agentdock service-install
+```
+
+Windows 首次安装用户登录 Scheduled Task：
+
+```powershell
+.\agentdock.cmd service-install
+```
+
+之后两边使用同一组 service 命令：
+
+```text
+macOS:   ./agentdock service-status|service-start|service-stop|service-restart|service-uninstall
+Windows: .\agentdock.cmd service-status|service-start|service-stop|service-restart|service-uninstall
+```
+
+macOS 后台活动名称为 **AgentDock Secure Tunnel**；Windows Task Scheduler 中的任务路径为 `\AgentDock\AgentDock Secure Tunnel`。两种后台模式都会在用户登录后自动启动，并在 tunnel-client 异常退出时由系统级后台机制重新拉起。每台机器应使用自己创建的 OpenAI Tunnel ID / Runtime API Key，不要让两台机器长期抢同一个 Tunnel。
 
 ## 5. ChatGPT 网页端配置
 
@@ -311,12 +347,13 @@ deployment_mode: 'auto'
 可选值：
 
 ```text
-auto    优先 Docker；所有 Docker 方案不可用时可显式确认 native 风险
-docker  强制 Docker，不允许 native fallback
-native  直接宿主机运行 AgentDock
+auto      优先 Docker；所有 Docker 方案不可用时可显式确认 native 风险
+docker    强制 Docker，不允许 native fallback
+native    直接宿主机运行 AgentDock
+external  不管理 AgentDock，只把 tunnel 连接到已经运行的本地 AgentDock
 ```
 
-推荐使用 Docker。
+需要由本项目管理 AgentDock 时推荐使用 Docker；已有独立 AgentDock 实例时使用 `external`。
 
 ## Docker 与 native 的区别
 
@@ -349,8 +386,9 @@ native 模式没有容器目录隔离，也无法强制执行 `ro/rw` workspace 
 
 - 识别 OS / CPU 架构；
 - 下载匹配的 OpenAI `tunnel-client runtime-cloudflared` 到 `.runtime/bin/`；
-- 生成 AgentDock 本地 Bearer Token；
-- 根据 `deployment_mode` 选择 Docker 或 native；
+- Docker/native 模式生成本项目管理的 AgentDock Bearer Token；
+- 根据 `deployment_mode` 选择 Docker、native 或 external；
+- external 模式只验证已有 AgentDock 的健康状态与 Bearer Token，不下载或启动 AgentDock；
 - Windows 下可启动已有 Docker Desktop，或准备 WSL + Docker Engine；
 - Docker 模式拉取 `ghcr.io/uvwt/agentdock:latest`；
 - native 模式下载 AgentDock 官方二进制到 `.runtime/bin/`。

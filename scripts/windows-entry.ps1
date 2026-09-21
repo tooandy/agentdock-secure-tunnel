@@ -5,19 +5,20 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $MainScript = Join-Path $PSScriptRoot 'windows.ps1'
 $BootstrapScript = Join-Path $PSScriptRoot 'bootstrap-tunnel.ps1'
+$ServiceScript = Join-Path $PSScriptRoot 'windows-tunnel-service.ps1'
 $Runtime = Join-Path $Root '.runtime'
+$TunnelExe = Join-Path $Runtime 'bin\tunnel-client.exe'
 $ChildPowerShell = Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path -LiteralPath $ChildPowerShell -PathType Leaf)) {
     $ChildPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 }
 $script:EntryExitCode = 1
 $command = if ($args.Count -gt 0) { ([string]$args[0]).ToLowerInvariant() } else { 'help' }
-$known = @('help','install','start','stop','restart','apply','status','logs','update')
+$serviceCommands = @('service-install','service-start','service-stop','service-restart','service-status','service-uninstall')
+$known = @('help','install','start','stop','restart','apply','status','logs','update','tunnel-run') + $serviceCommands
 
 function Invoke-ScriptStep([string]$Path, [string[]]$Arguments) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing script: $Path" }
-    # -File, not an interpolated -Command string. A fresh PowerShell process gives
-    # us the script's exit code, not a stale native-probe LASTEXITCODE.
     & $ChildPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Path @Arguments
     $code = $LASTEXITCODE
     if ($code -ne 0) {
@@ -26,16 +27,60 @@ function Invoke-ScriptStep([string]$Path, [string[]]$Arguments) {
     }
 }
 
+function Ensure-TunnelClient([bool]$Force) {
+    if (-not $Force -and (Test-Path -LiteralPath $TunnelExe -PathType Leaf)) { return }
+    Write-Host $(if ($Force) { '==> Updating tunnel-client' } else { '==> Preparing tunnel-client' })
+    Invoke-ScriptStep -Path $BootstrapScript -Arguments @()
+}
+
+function Show-ControlPlaneStatus {
+    if (Test-ControlPlaneConnected -RuntimeDir $Runtime) {
+        Write-Host 'Control Plane : CONNECTED' -ForegroundColor Green
+        return $true
+    }
+    Write-Host 'Control Plane : UNVERIFIED' -ForegroundColor Yellow
+    return $false
+}
+
 try {
     if ($args.Count -gt 1 -or $command -notin $known) {
-        [Console]::Error.WriteLine('Usage: .\agentdock.cmd {install|start|stop|restart|apply|status|logs|update|help}')
+        [Console]::Error.WriteLine('Usage: .\agentdock.cmd {install|start|stop|restart|apply|status|logs|update|service-install|service-start|service-stop|service-restart|service-status|service-uninstall|help}')
         exit 2
     }
+
     . (Join-Path $PSScriptRoot 'windows-runtime-checks.ps1')
-    if ($command -in @('install','start','restart','apply','update')) {
+
+    if ($command -in @('install','start','restart','apply','update','tunnel-run','service-install','service-start','service-restart')) {
         Configure-TunnelProxy
-        Write-Host '==> Preparing tunnel-client'
-        Invoke-ScriptStep -Path $BootstrapScript -Arguments @()
+    }
+
+    if ($command -in $serviceCommands) {
+        $subcommand = $command.Substring('service-'.Length)
+        if ($command -eq 'service-install') {
+            Ensure-TunnelClient $false
+            Invoke-ScriptStep -Path $MainScript -Arguments @('install')
+        }
+        Invoke-ScriptStep -Path $ServiceScript -Arguments @($subcommand)
+
+        if ($command -eq 'service-status') {
+            Invoke-ScriptStep -Path $MainScript -Arguments @('status')
+            [void](Show-ControlPlaneStatus)
+        } elseif ($command -in @('service-install','service-start','service-restart')) {
+            if (-not (Wait-ControlPlaneConnected -RuntimeDir $Runtime)) {
+                Write-Host 'Control Plane : UNVERIFIED' -ForegroundColor Yellow
+                [Console]::Error.WriteLine('The scheduled tunnel task is running, but no recent control-plane poll was verified. It has NOT been stopped.')
+                exit 2
+            }
+            Write-Host 'Control Plane : CONNECTED' -ForegroundColor Green
+            Write-Host 'Verify end-to-end access with a read-only tool call in ChatGPT.'
+        }
+        exit 0
+    }
+
+    if ($command -in @('install','start','restart','apply')) {
+        Ensure-TunnelClient $false
+    } elseif ($command -eq 'update') {
+        Ensure-TunnelClient $true
     }
 
     $modePath = Join-Path $Runtime 'deployment.txt'
@@ -43,17 +88,17 @@ try {
     if ($wslManaged -and $command -in @('start','restart','apply','stop','status')) {
         . (Join-Path $PSScriptRoot 'windows-wsl-session.ps1')
         if ($command -in @('start','restart','apply')) {
-            # Start BEFORE Docker/preflight. The attached wsl.exe stays alive
-            # after this entry process returns; restart keeps the same holder.
             Start-AgentDockWslSession -RuntimeDir $Runtime -HelperScript (Join-Path $PSScriptRoot 'wsl-session.sh')
         } elseif ($command -eq 'stop' -and (Test-Path -LiteralPath (Join-Path $Runtime 'wsl-session.json'))) {
             [void](Assert-WslSessionDefault -RuntimeDir $Runtime)
         }
     }
+
     Invoke-ScriptStep -Path $MainScript -Arguments @($command)
+
+    if ($command -eq 'tunnel-run') { exit 0 }
+
     if ($wslManaged -and $command -eq 'stop') {
-        # Only release after services stopped successfully. A failed stop keeps
-        # the session available for diagnosis; it never shuts down all of WSL.
         Stop-AgentDockWslSession -RuntimeDir $Runtime
     }
     if ($wslManaged -and $command -eq 'status') { Show-AgentDockWslSession -RuntimeDir $Runtime }
@@ -68,11 +113,7 @@ try {
         Write-Host 'Control Plane : CONNECTED' -ForegroundColor Green
         Write-Host 'Verify end-to-end access with a read-only tool call in ChatGPT.'
     } elseif ($command -eq 'status') {
-        if (Test-ControlPlaneConnected -RuntimeDir $Runtime) {
-            Write-Host 'Control Plane : CONNECTED' -ForegroundColor Green
-        } else {
-            Write-Host 'Control Plane : UNVERIFIED' -ForegroundColor Yellow
-        }
+        [void](Show-ControlPlaneStatus)
     }
     exit 0
 } catch {

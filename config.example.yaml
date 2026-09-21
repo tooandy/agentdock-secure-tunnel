@@ -1,10 +1,17 @@
 # Copy this file to config.yaml and edit the values below.
 # config.yaml is ignored by Git so your Runtime API Key is not committed.
 
-# auto   = prefer Docker; if Docker is unavailable, ask before native install
-# docker = require Docker isolation
-# native = install AgentDock directly on the host (no container isolation)
+# auto     = prefer Docker; if Docker is unavailable, ask before native install
+# docker   = require Docker isolation
+# native   = install AgentDock directly on the host (no container isolation)
+# external = reuse an already-running AgentDock on 127.0.0.1:agentdock_port;
+#            macOS Desktop reuses AGENTDOCK_AUTH_TOKEN from agentdock.env;
+#            Windows Desktop reuses auth-token.dpapi for the current Windows user
 deployment_mode: 'auto'
+
+# Optional for Windows external mode. Leave empty to auto-detect the runtime root
+# from the running AgentDock process, then fall back to %LOCALAPPDATA%\AgentDock.
+# external_agentdock_runtime_root: '%LOCALAPPDATA%\AgentDock'
 
 tunnel_id: 'TUNNEL_ID_HERE'
 runtime_api_key: 'RUNTIME_API_KEY_HERE'

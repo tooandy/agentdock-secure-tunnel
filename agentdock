@@ -3,11 +3,24 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 trap 'rc=$?; printf "ERROR: agentdock launcher stopped (exit %s). See the message above.\n" "$rc" >&2; exit "$rc"' ERR
 
-# Only commands that need a runtime may bootstrap it. Help/status/stop/logs
-# must remain usable without GitHub access, even on a fresh checkout.
+# macOS background-service management is kept separate from the runtime logic.
 case "${1:-help}" in
-  install|start|restart|apply|update)
-    printf '==> Preparing tunnel-client\n' >&2
+  service-install|service-start|service-stop|service-restart|service-status|service-uninstall)
+    exec bash "$ROOT_DIR/scripts/macos-tunnel-service.sh" "${1#service-}"
+    ;;
+esac
+
+# Local management commands should not require GitHub access when tunnel-client
+# is already installed. Only update always checks the upstream release.
+case "${1:-help}" in
+  install|start|restart|apply)
+    if [ ! -x "$ROOT_DIR/.runtime/bin/tunnel-client" ]; then
+      printf '==> Preparing tunnel-client\n' >&2
+      bash "$ROOT_DIR/scripts/bootstrap-tunnel.sh"
+    fi
+    ;;
+  update)
+    printf '==> Updating tunnel-client\n' >&2
     bash "$ROOT_DIR/scripts/bootstrap-tunnel.sh"
     ;;
 esac
