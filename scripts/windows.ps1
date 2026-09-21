@@ -107,12 +107,24 @@ function Read-Config {
     $port = 0
     if (-not [int]::TryParse([string]$top['agentdock_port'],[ref]$port) -or $port -lt 1 -or $port -gt 65535) { Fail 'agentdock_port must be 1-65535.' }
 
+    # The tunnel-client health/metrics server binds 127.0.0.1:8080 by default.
+    # Exposure on that port is common (e.g. WSL2), so let config relocate it.
+    $metricsPort = 0
+    if ($top.ContainsKey('metrics_port')) {
+        if (-not [int]::TryParse([string]$top['metrics_port'],[ref]$metricsPort) -or $metricsPort -lt 1 -or $metricsPort -gt 65535) {
+            Fail 'metrics_port must be 1-65535.'
+        }
+    } else {
+        $metricsPort = 8080
+    }
+
     $externalRuntimeRoot = if ($top.ContainsKey('external_agentdock_runtime_root')) { [string]$top['external_agentdock_runtime_root'] } else { '' }
     if ($requestedMode -eq 'external') {
         return [pscustomobject]@{
             TunnelId=[string]$top['tunnel_id']
             RuntimeApiKey=[string]$top['runtime_api_key']
             Port=$port
+            MetricsPort=$metricsPort
             DefaultWorkspace=''
             RequestedMode=$requestedMode
             Workspaces=@()
@@ -140,6 +152,7 @@ function Read-Config {
         TunnelId=[string]$top['tunnel_id']
         RuntimeApiKey=[string]$top['runtime_api_key']
         Port=$port
+        MetricsPort=$metricsPort
         DefaultWorkspace=$default
         RequestedMode=$requestedMode
         Workspaces=$workspaces
@@ -163,7 +176,13 @@ function Get-Arch {
 }
 
 function Get-ReleaseAsset([string]$Repo,[string]$Pattern) {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{'User-Agent'='agentdock-secure-tunnel'}
+    # GH_TOKEN/GITHUB_TOKEN lifts the unauthenticated 60/hour API limit to
+    # 5000/hour on shared IPs. Do NOT pass your OpenAI API key here.
+    $headers = @{'User-Agent' = 'agentdock-secure-tunnel'}
+    $token = $env:GH_TOKEN
+    if (-not $token) { $token = $env:GITHUB_TOKEN }
+    if ($token) { $headers['Authorization'] = "Bearer $token" }
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers
     $asset = $release.assets | Where-Object {$_.name -match $Pattern} | Select-Object -First 1
     if (-not $asset) { Fail "No release asset matched $Pattern in $Repo" }
     return $asset
@@ -929,13 +948,42 @@ function Start-Native($Config,[string]$Token) {
 function Start-Tunnel($Config,[string]$Token) {
     $env:CONTROL_PLANE_API_KEY = $Config.RuntimeApiKey
     $env:AGENTDOCK_BEARER_HEADER = "Bearer $Token"
+    $env:HEALTH_LISTEN_ADDR = "127.0.0.1:$($Config.MetricsPort)"
+    Set-Content (Join-Path $Runtime 'tunnel-metrics.port') $Config.MetricsPort -Encoding ASCII
     if (-not (Test-PidFile $TunnelPid)) {
         Remove-Item $TunnelLog,$TunnelErr -Force -ErrorAction SilentlyContinue
-        $p = Start-Process -FilePath $TunnelExe -ArgumentList @('run','--profile-file',$TunnelProfile) -WindowStyle Hidden -PassThru -RedirectStandardOutput $TunnelLog -RedirectStandardError $TunnelErr
+        $tunnelArgs = @('run','--profile-file',$TunnelProfile)
+        # Route the OpenAI control plane through the corporate proxy (resolved by
+        # Configure-TunnelProxy from the PAC), but keep the LOCAL MCP server
+        # (127.0.0.1) direct. --control-plane.http-proxy scopes the proxy to the
+        # control plane only, unlike the global --http-proxy which would force the
+        # local MCP request through the proxy and get it cut off (EOF/502).
+        $proxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { $env:HTTP_PROXY }
+        if ($proxy) { $tunnelArgs += @('--control-plane.http-proxy',$proxy) }
+        $env:HTTP_PROXY = $proxy
+        $env:HTTPS_PROXY = $proxy
+        Add-LoopbackNoProxy
+        $p = Start-Process -FilePath $TunnelExe -ArgumentList $tunnelArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $TunnelLog -RedirectStandardError $TunnelErr
         Set-Content $TunnelPid $p.Id -Encoding ASCII
         Start-Sleep 2
         if (-not (Test-PidFile $TunnelPid)) { Fail 'tunnel-client failed to start. Run logs.' }
     }
+}
+
+function Add-LoopbackNoProxy {
+    # Keep loopback/local MCP endpoints off the corporate proxy so tunnel-client
+    # reaches the local AgentDock directly while the control plane goes outbound.
+    $items = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($env:NO_PROXY)) {
+        foreach ($item in ($env:NO_PROXY -split '[,;]')) {
+            $v = $item.Trim()
+            if ($v -and -not $items.Contains($v)) { $items.Add($v) }
+        }
+    }
+    foreach ($required in @('127.0.0.1','localhost','::1')) {
+        if (-not $items.Contains($required)) { $items.Add($required) }
+    }
+    $env:NO_PROXY = $items -join ','
 }
 
 function Wait-AgentDock([int]$Port) {
@@ -977,8 +1025,16 @@ function Tunnel-RunCommand {
 
     $env:CONTROL_PLANE_API_KEY = $cfg.RuntimeApiKey
     $env:AGENTDOCK_BEARER_HEADER = "Bearer $token"
+    $env:HEALTH_LISTEN_ADDR = "127.0.0.1:$($cfg.MetricsPort)"
+    Set-Content (Join-Path $Runtime 'tunnel-metrics.port') $cfg.MetricsPort -Encoding ASCII
     Remove-Item $TunnelLog,$TunnelErr -Force -ErrorAction SilentlyContinue
-    $p = Start-Process -FilePath $TunnelExe -ArgumentList @('run','--profile-file',$TunnelProfile) -WindowStyle Hidden -PassThru -RedirectStandardOutput $TunnelLog -RedirectStandardError $TunnelErr
+    $tunnelArgs = @('run','--profile-file',$TunnelProfile)
+    $proxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { $env:HTTP_PROXY }
+    if ($proxy) { $tunnelArgs += @('--control-plane.http-proxy',$proxy) }
+    $env:HTTP_PROXY = $proxy
+    $env:HTTPS_PROXY = $proxy
+    Add-LoopbackNoProxy
+    $p = Start-Process -FilePath $TunnelExe -ArgumentList $tunnelArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $TunnelLog -RedirectStandardError $TunnelErr
     Set-Content $TunnelPid $p.Id -Encoding ASCII
     try {
         $p.WaitForExit()

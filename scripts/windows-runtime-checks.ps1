@@ -8,32 +8,57 @@ function Normalize-ProxyUrl([string]$Value) {
 }
 
 function Get-SystemProxy {
+    # Two sources: the static registry ProxyServer (ProxyEnable=1), and PAC/WPAD
+    # auto-proxy. PAC setups (common on corporate networks) leave ProxyEnable=0
+    # and only set AutoConfigURL, so the registry branch returns nothing. Resolve
+    # those through .NET's system web proxy, which evaluates the PAC and yields
+    # the concrete HTTP(S) proxy for a given URL. Loopback stays bypassed.
+    $http = $null
+    $https = $null
     try {
         $settings = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
-        if ([int]$settings.ProxyEnable -ne 1) { return $null }
-        $raw = [string]$settings.ProxyServer
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        $http = $null
-        $https = $null
-        if ($raw.Contains('=')) {
-            foreach ($part in ($raw -split ';')) {
-                $pair = $part.Split('=', 2)
-                if ($pair.Count -ne 2) { continue }
-                $value = Normalize-ProxyUrl $pair[1]
-                switch ($pair[0].Trim().ToLowerInvariant()) {
-                    'http' { $http = $value }
-                    'https' { $https = $value }
+        if ([int]$settings.ProxyEnable -eq 1) {
+            $raw = [string]$settings.ProxyServer
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                if ($raw.Contains('=')) {
+                    foreach ($part in ($raw -split ';')) {
+                        $pair = $part.Split('=', 2)
+                        if ($pair.Count -ne 2) { continue }
+                        $value = Normalize-ProxyUrl $pair[1]
+                        switch ($pair[0].Trim().ToLowerInvariant()) {
+                            'http' { $http = $value; if (-not $https) { $https = $value } }
+                            'https' { $https = $value; if (-not $http) { $http = $value } }
+                        }
+                    }
+                } else {
+                    $http = Normalize-ProxyUrl $raw
+                    $https = $http
                 }
             }
-        } else {
-            $http = Normalize-ProxyUrl $raw
-            $https = $http
         }
-        if (-not $https) { $https = $http }
-        if (-not $http) { $http = $https }
-        if (-not $http -and -not $https) { return $null }
-        return [pscustomobject]@{ Http=$http; Https=$https }
-    } catch { return $null }
+    } catch { $http = $null; $https = $null }
+
+    # PAC/WPAD resolution: ask the system web proxy for the proxy that would be
+    # used for an external HTTPS host, e.g. api.openai.com. If it yields a real
+    # proxy and that host is not bypassed, use it. api.openai.com is a reasonable
+    # stand-in for "external internet"; internal-only PACs typically bypass it.
+    try {
+        $sys = [Net.WebRequest]::GetSystemWebProxy()
+        $test = [Uri]'https://api.openai.com/'
+        if (-not $sys.IsBypassed($test)) {
+            $resolved = $sys.GetProxy($test)
+            if ($null -ne $resolved -and $resolved.Authority) {
+                $auto = 'http://' + $resolved.Authority
+                if (-not $http) { $http = $auto }
+                if (-not $https) { $https = $auto }
+            }
+        }
+    } catch { }
+
+    if (-not $https) { $https = $http }
+    if (-not $http) { $http = $https }
+    if (-not $http -and -not $https) { return $null }
+    return [pscustomobject]@{ Http=$http; Https=$https }
 }
 
 function Add-LoopbackNoProxy {
@@ -82,9 +107,25 @@ function Get-PollTimestamp([string]$Content) {
     return $latest
 }
 
-function Read-LocalTunnelMetrics {
+function Get-TunnelMetricsAddr([string]$RuntimeDir) {
+    # The tunnel-client health/metrics server binds 127.0.0.1:8080 by default.
+    # It may be relocated via config (metrics_port); windows.ps1 records the
+    # resolved port in a metrics-port file inside $RuntimeDir so this orchestrator
+    # (a separate process) can verify the right listener. AGENTDOCK_METRICS_PORT
+    # overrides the default. Never use a proxy for the loopback endpoint.
+    $portFile = Join-Path $RuntimeDir 'tunnel-metrics.port'
+    if (Test-Path -LiteralPath $portFile -PathType Leaf) {
+        $v = (Get-Content -LiteralPath $portFile -Raw).Trim()
+        if ($v -match '^\d+$') { return "127.0.0.1:$v" }
+    }
+    $port = $env:AGENTDOCK_METRICS_PORT
+    if ($port -match '^\d+$') { return "127.0.0.1:$port" }
+    return '127.0.0.1:8080'
+}
+
+function Read-LocalTunnelMetrics([string]$RuntimeDir) {
     # Never use a proxy for the loopback diagnostics endpoint.
-    $request = [Net.WebRequest]::Create('http://127.0.0.1:8080/metrics')
+    $request = [Net.WebRequest]::Create('http://' + (Get-TunnelMetricsAddr $RuntimeDir) + '/metrics')
     $request.Proxy = $null
     $request.Timeout = 2000
     $request.ReadWriteTimeout = 2000
@@ -107,11 +148,13 @@ function Test-ControlPlaneConnected([string]$RuntimeDir) {
         $process = Get-Process -Id $processId -ErrorAction Stop
         $expected = [IO.Path]::GetFullPath((Join-Path $RuntimeDir 'bin\tunnel-client.exe'))
         if (-not [string]::Equals($process.Path, $expected, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-        $listeners = @(Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction Stop)
+        $addr = Get-TunnelMetricsAddr $RuntimeDir
+        $port = ([uri]"http://$addr").Port
+        $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop)
         $owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
         if ($owners.Count -ne 1 -or $owners[0] -ne $processId) { return $false }
 
-        $content = Read-LocalTunnelMetrics
+        $content = Read-LocalTunnelMetrics $RuntimeDir
         $stamp = Get-PollTimestamp $content
         $epoch = [DateTime]::SpecifyKind([DateTime]'1970-01-01', [DateTimeKind]::Utc)
         $now = ([DateTime]::UtcNow - $epoch).TotalSeconds

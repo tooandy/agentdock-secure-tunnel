@@ -36,6 +36,23 @@ class ExternalModeStaticTests(unittest.TestCase):
             self.assertIn(command, text)
         self.assertIn("tunnel-run", text)
 
+    def test_github_api_calls_support_a_token(self):
+        # Unauthenticated api.github.com calls are capped at 60/hour per IP, which
+        # stalls bootstrap on shared networks. Both PowerShell download paths must
+        # forward GH_TOKEN/GITHUB_TOKEN to lift the limit.
+        windows = (ROOT / "scripts/windows.ps1").read_text(encoding="utf-8")
+        for marker in (
+            "$env:GH_TOKEN",
+            "$env:GITHUB_TOKEN",
+            "api.github.com/repos/$Repo/releases/latest",
+        ):
+            self.assertIn(marker, windows)
+
+        bootstrap = (ROOT / "scripts/bootstrap-tunnel.ps1").read_text(encoding="utf-8")
+        self.assertIn("$env:GH_TOKEN", bootstrap)
+        self.assertIn("$env:GITHUB_TOKEN", bootstrap)
+        self.assertIn("api.github.com/repos/openai/tunnel-client/releases/latest", bootstrap)
+
     def test_example_documents_windows_runtime_override(self):
         text = (ROOT / "config.example.yaml").read_text(encoding="utf-8")
         self.assertIn("external_agentdock_runtime_root", text)

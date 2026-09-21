@@ -17,6 +17,11 @@ tunnel_id: 'TUNNEL_ID_HERE'
 runtime_api_key: 'RUNTIME_API_KEY_HERE'
 agentdock_port: 18765
 
+# Optional. Port for the tunnel-client health/metrics endpoint. Defaults to 8080.
+# Change this if another process (e.g. your WSL2 stack) already binds 8080.
+# Valid range: 1-65535.
+# metrics_port: 8082
+
 # Workspace names are derived automatically from the final directory name.
 # /home/user/project/VisionAgent -> VisionAgent
 # D:\work\chatgpt-workspace      -> chatgpt-workspace

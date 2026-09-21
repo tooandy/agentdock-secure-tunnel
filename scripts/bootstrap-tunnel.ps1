@@ -19,9 +19,20 @@ function Get-Arch {
     }
 }
 
+# The GitHub API rate-limits unauthenticated requests to 60/hour per IP, which
+# is easy to exhaust on shared networks. A GH_TOKEN/GITHUB_TOKEN raises that to
+# 5000/hour. Do NOT pass your OpenAI API key here; it is not a GitHub token.
+function Get-GithubHeaders {
+    $headers = @{'User-Agent' = 'agentdock-secure-tunnel'}
+    $token = $env:GH_TOKEN
+    if (-not $token) { $token = $env:GITHUB_TOKEN }
+    if ($token) { $headers['Authorization'] = "Bearer $token" }
+    return $headers
+}
+
 New-Item -ItemType Directory -Force $Runtime, $Bin | Out-Null
 $arch = Get-Arch
-$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/openai/tunnel-client/releases/latest' -Headers @{'User-Agent'='agentdock-secure-tunnel'}
+$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/openai/tunnel-client/releases/latest' -Headers (Get-GithubHeaders)
 $asset = $release.assets | Where-Object { $_.name -match "^tunnel-client-runtime-cloudflared-v.+-windows-${arch}\.zip$" } | Select-Object -First 1
 if (-not $asset) { throw "Unable to locate tunnel-client runtime-cloudflared asset for Windows $arch" }
 
