@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.aniss.agentdock-secure-tunnel</string>
+  <string>io.github.tooandy.agentdock-secure-tunnel</string>
 
   <key>ProgramArguments</key>
   <array>

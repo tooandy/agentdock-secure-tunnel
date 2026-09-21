@@ -17,7 +17,7 @@ TUNNEL_LOG="$RUNTIME/tunnel-client.log"
 NATIVE_LOG="$RUNTIME/agentdock-native.log"
 NATIVE_HOME="$RUNTIME/agentdock-home"
 DESKTOP_ENV="${AGENTDOCK_DESKTOP_ENV:-$HOME/Library/Application Support/AgentDock/agentdock.env}"
-LAUNCHD_LABEL="com.aniss.agentdock-secure-tunnel"
+LAUNCHD_LABEL="io.github.tooandy.agentdock-secure-tunnel"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }

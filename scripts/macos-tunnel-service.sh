@@ -2,11 +2,13 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LABEL="com.aniss.agentdock-secure-tunnel"
+LABEL="io.github.tooandy.agentdock-secure-tunnel"
+LEGACY_LABEL="com.$(id -un).agentdock-secure-tunnel"
 DOMAIN="gui/$(id -u)"
 TEMPLATE="$ROOT_DIR/launchd/$LABEL.plist.template"
 RUNTIME_PLIST="$ROOT_DIR/.runtime/$LABEL.plist"
 INSTALLED_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LEGACY_INSTALLED_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 EXECUTABLE="$ROOT_DIR/scripts/AgentDock Secure Tunnel"
 LOG_PATH="$HOME/Library/Logs/agentdock-secure-tunnel.log"
 
@@ -20,6 +22,14 @@ require_macos() {
 
 is_loaded() {
   launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+migrate_legacy_service() {
+  [ "$LEGACY_LABEL" != "$LABEL" ] || return 0
+  if launchctl print "$DOMAIN/$LEGACY_LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN/$LEGACY_LABEL" >/dev/null 2>&1 || true
+  fi
+  rm -f "$LEGACY_INSTALLED_PLIST" "$ROOT_DIR/.runtime/$LEGACY_LABEL.plist"
 }
 
 render_plist() {
@@ -45,6 +55,7 @@ install_service() {
   chmod +x "$EXECUTABLE"
   "$ROOT_DIR/agentdock" install
   render_plist
+  migrate_legacy_service
   if is_loaded; then
     launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
   fi
